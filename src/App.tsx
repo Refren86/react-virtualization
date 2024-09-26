@@ -1,8 +1,8 @@
 import { useState } from "react";
-import { Grid } from "./examples/Simple";
+import { VirtualizedList } from "./examples/VirtualizedList";
 
 const examplesMap = {
-  simple: Grid,
+  simple: VirtualizedList,
 };
 
 type Example = keyof typeof examplesMap;

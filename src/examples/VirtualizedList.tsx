@@ -2,48 +2,43 @@ import { faker } from "@faker-js/faker";
 import {
   useCallback,
   useEffect,
-  useInsertionEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 
+import {
+  isNumber,
+  rafThrottle,
+  scheduleDOMUpdate,
+  useLatest,
+  useResizeObserver,
+} from "../utils";
+
 type Key = string | number;
 
-interface UseDynamicSizeGridProps {
+interface UseDynamicSizeListProps {
   rowsCount: number;
   rowHeight?: (index: number) => number;
   estimateRowHeight?: (index: number) => number;
   getRowKey: (index: number) => Key;
-  columnsCount: number;
-  columnWidth: (index: number) => number;
-  getColumnKey: (index: number) => Key;
   overscanY?: number;
-  overscanX?: number;
   scrollingDelay?: number;
   getScrollElement: () => HTMLElement | null;
 }
 
-interface DynamicSizeGridRow {
+interface DynamicSizeListRow {
   key: Key;
   index: number;
   offsetTop: number;
   height: number;
 }
 
-interface DynamicSizeGridColumn {
-  key: Key;
-  index: number;
-  offsetLeft: number;
-  width: number;
-}
-
 const DEFAULT_OVERSCAN_Y = 3;
-const DEFAULT_OVERSCAN_X = 3;
 const DEFAULT_SCROLLING_DELAY = 150;
 
-function validateProps(props: UseDynamicSizeGridProps) {
+function validateProps(props: UseDynamicSizeListProps) {
   const { rowHeight, estimateRowHeight } = props;
 
   if (!rowHeight && !estimateRowHeight) {
@@ -53,15 +48,7 @@ function validateProps(props: UseDynamicSizeGridProps) {
   }
 }
 
-function useLatest<T>(value: T) {
-  const valueRef = useRef(value);
-  useInsertionEffect(() => {
-    valueRef.current = value;
-  });
-  return valueRef;
-}
-
-function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
+function useDynamicSizeList(props: UseDynamicSizeListProps) {
   validateProps(props);
 
   const {
@@ -69,23 +56,17 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
     estimateRowHeight,
     getRowKey,
     rowsCount,
-    columnsCount,
-    columnWidth,
-    getColumnKey,
-    overscanX = DEFAULT_OVERSCAN_X,
     scrollingDelay = DEFAULT_SCROLLING_DELAY,
     overscanY = DEFAULT_OVERSCAN_Y,
     getScrollElement,
   } = props;
 
-  const [measurementCache, setRowSizeCache] = useState<Record<Key, number>>({});
-  const [gridHeight, setGridHeight] = useState(0);
-  const [gridWidth, setGridWidth] = useState(0);
+  const [rowSizeCache, setRowSizeCache] = useState<Record<Key, number>>({});
+  const [virtualRowHeight, setVirtualRowHeight] = useState(0);
   const [scrollTop, setScrollTop] = useState(0);
-  const [scrollLeft, setScrollLeft] = useState(0);
   const [isScrolling, setIsScrolling] = useState(false);
 
-  // observe the scroll container size and update the grid height
+  // observe the scroll container size and update the row height
   useLayoutEffect(() => {
     const scrollElement = getScrollElement();
 
@@ -100,12 +81,10 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
       const size = entry.borderBoxSize[0]
         ? {
             height: entry.borderBoxSize[0].blockSize,
-            width: entry.borderBoxSize[0].inlineSize,
           }
         : entry.target.getBoundingClientRect();
 
-      setGridHeight(size.height);
-      setGridWidth(size.width);
+      setVirtualRowHeight(size.height);
     });
 
     resizeObserver.observe(scrollElement);
@@ -115,7 +94,6 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
     };
   }, [getScrollElement]);
 
-  // track scroll position (TODO: add debounce)
   useLayoutEffect(() => {
     const scrollElement = getScrollElement();
 
@@ -124,17 +102,17 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
     }
 
     const handleScroll = () => {
-      const { scrollTop, scrollLeft } = scrollElement;
-
+      const { scrollTop } = scrollElement;
       setScrollTop(scrollTop);
-      setScrollLeft(scrollLeft);
     };
 
     handleScroll();
 
-    scrollElement.addEventListener("scroll", handleScroll);
+    const throttleHandleScroll = rafThrottle(handleScroll);
 
-    return () => scrollElement.removeEventListener("scroll", handleScroll);
+    scrollElement.addEventListener("scroll", throttleHandleScroll);
+    return () =>
+      scrollElement.removeEventListener("scroll", throttleHandleScroll);
   }, [getScrollElement]);
 
   // detects when scrolling has stopped (after a delay)
@@ -150,7 +128,7 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
     const handleScroll = () => {
       setIsScrolling(true);
 
-      if (typeof timeoutId === "number") {
+      if (isNumber(timeoutId)) {
         clearTimeout(timeoutId);
       }
 
@@ -162,7 +140,7 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
     scrollElement.addEventListener("scroll", handleScroll);
 
     return () => {
-      if (typeof timeoutId === "number") {
+      if (isNumber(timeoutId)) {
         clearTimeout(timeoutId);
       }
       scrollElement.removeEventListener("scroll", handleScroll);
@@ -178,20 +156,20 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
         }
 
         const key = getRowKey(index);
-        if (typeof measurementCache[key] === "number") {
-          return measurementCache[key]!;
+        if (isNumber(rowSizeCache[key])) {
+          return rowSizeCache[key]!;
         }
 
         return estimateRowHeight!(index);
       };
 
       const rangeStart = scrollTop;
-      const rangeEnd = scrollTop + gridHeight;
+      const rangeEnd = scrollTop + virtualRowHeight;
 
       let totalHeight = 0;
-      let rowStartIndex = -1;
-      let rowEndIndex = -1;
-      const allRows: DynamicSizeGridRow[] = Array(rowsCount);
+      let rowStartIndex = 0;
+      let rowEndIndex = 0;
+      const allRows: DynamicSizeListRow[] = Array(rowsCount);
 
       for (let index = 0; index < rowsCount; index++) {
         const key = getRowKey(index);
@@ -205,14 +183,17 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
         totalHeight += row.height;
         allRows[index] = row;
 
-        if (rowStartIndex === -1 && row.offsetTop + row.height > rangeStart) {
-          rowStartIndex = Math.max(0, index - overscanY);
+        if (row.offsetTop + row.height < rangeStart) {
+          rowStartIndex++;
         }
 
-        if (rowEndIndex === -1 && row.offsetTop + row.height >= rangeEnd) {
-          rowEndIndex = Math.min(rowsCount - 1, index + overscanY);
+        if (row.offsetTop + row.height < rangeEnd) {
+          rowEndIndex++;
         }
       }
+
+      rowStartIndex = Math.max(0, rowStartIndex - overscanY);
+      rowEndIndex = Math.min(rowsCount - 1, rowEndIndex + overscanY);
 
       const virtualRows = allRows.slice(rowStartIndex, rowEndIndex + 1);
 
@@ -226,88 +207,25 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
     }, [
       scrollTop,
       overscanY,
-      gridHeight,
+      virtualRowHeight,
       rowHeight,
       getRowKey,
       estimateRowHeight,
-      measurementCache,
+      rowSizeCache,
       rowsCount,
     ]);
 
   // keep track of the latest values in a ref to avoid stale closures
   const latestData = useLatest({
-    measurementCache,
+    rowSizeCache,
     getRowKey,
     allRows,
     getScrollElement,
     scrollTop,
   });
 
-  const {
-    virtualColumns,
-    columnStartIndex,
-    columnEndIndex,
-    allColumns,
-    totalWidth,
-  } = useMemo(() => {
-    const rangeStart = scrollLeft;
-    const rangeEnd = scrollLeft + gridWidth;
-
-    let totalWidth = 0;
-    let columnStartIndex = -1;
-    let columnEndIndex = -1;
-    const allColumns: DynamicSizeGridColumn[] = Array(columnsCount);
-
-    for (let index = 0; index < columnsCount; index++) {
-      const key = getColumnKey(index);
-      const column: DynamicSizeGridColumn = {
-        key,
-        index,
-        width: columnWidth(index),
-        offsetLeft: totalWidth,
-      };
-
-      totalWidth += column.width;
-      allColumns[index] = column;
-
-      if (
-        columnStartIndex === -1 &&
-        column.offsetLeft + column.width > rangeStart
-      ) {
-        columnStartIndex = Math.max(0, index - overscanX);
-      }
-
-      if (
-        columnEndIndex === -1 &&
-        column.offsetLeft + column.width >= rangeEnd
-      ) {
-        columnEndIndex = Math.min(rowsCount - 1, index + overscanX);
-      }
-    }
-
-    const virtualColumns = allColumns.slice(
-      columnStartIndex,
-      columnEndIndex + 1
-    );
-
-    return {
-      virtualColumns,
-      columnStartIndex,
-      columnEndIndex,
-      allColumns,
-      totalWidth,
-    };
-  }, [
-    scrollLeft,
-    overscanX,
-    gridWidth,
-    columnWidth,
-    getColumnKey,
-    columnsCount,
-  ]);
-
-  // measure the height of individual grid rows
-  const measureRowInner = useCallback(
+  // measure the height of individual rows
+  const measureRowHeightInner = useCallback(
     (
       element: Element | null,
       resizeObserver: ResizeObserver,
@@ -332,7 +250,7 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
         );
         return;
       }
-      const { measurementCache, getRowKey, allRows, scrollTop } =
+      const { rowSizeCache, getRowKey, allRows, scrollTop } =
         latestData.current;
 
       const key = getRowKey(rowIndex);
@@ -340,7 +258,7 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
 
       resizeObserver.observe(element);
 
-      if (!isResize && typeof measurementCache[key] === "number") {
+      if (!isResize && isNumber(rowSizeCache[key])) {
         return;
       }
 
@@ -348,7 +266,7 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
         entry?.borderBoxSize[0]?.blockSize ??
         element.getBoundingClientRect().height;
 
-      if (measurementCache[key] === height) {
+      if (rowSizeCache[key] === height) {
         return;
       }
 
@@ -358,7 +276,9 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
       if (delta !== 0 && scrollTop > row.offsetTop) {
         const element = getScrollElement();
         if (element) {
-          element.scrollBy(0, delta);
+          scheduleDOMUpdate(() => {
+            element.scrollBy(0, delta);
+          });
         }
       }
 
@@ -367,19 +287,15 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
     []
   );
 
-  // creates a single ResizeObserver instance that can be reused for all grid rows
-  const rowsResizeObserver = useMemo(() => {
-    const ro = new ResizeObserver((entries) => {
-      entries.forEach((entry) => {
-        measureRowInner(entry.target, ro, entry);
-      });
+  const rowsResizeObserver = useResizeObserver((entries, observer) => {
+    entries.forEach((entry) => {
+      measureRowHeightInner(entry.target, observer, entry);
     });
-    return ro;
-  }, [latestData]);
+  });
 
   const measureRow = useCallback(
     (element: Element | null) => {
-      measureRowInner(element, rowsResizeObserver);
+      measureRowHeightInner(element, rowsResizeObserver);
     },
     [rowsResizeObserver]
   );
@@ -392,53 +308,38 @@ function useDynamicSizeGrid(props: UseDynamicSizeGridProps) {
     isScrolling,
     allRows,
     measureRow,
-    virtualColumns,
-    columnStartIndex,
-    columnEndIndex,
-    allColumns,
-    totalWidth,
   };
 }
 
 const containerHeight = 600;
-const gridSize = 100;
+const rowsCount = 100;
 
 const createItems = () =>
-  Array.from({ length: gridSize }, (_) => ({
+  Array.from({ length: rowsCount }, (_) => ({
     id: Math.random().toString(36).slice(2),
-    columns: Array.from({ length: gridSize }, () => ({
-      id: Math.random().toString(36).slice(2),
-      text: faker.lorem.words({ min: 1, max: 4 }),
-    })),
+    text: faker.lorem.words({ min: 1, max: 4 }),
   }));
 
-export function Grid() {
-  const [gridItems, setGridItems] = useState(createItems);
+export function VirtualizedList() {
+  const [listItems, setListItems] = useState(createItems);
   const scrollElementRef = useRef<HTMLDivElement>(null);
 
-  const { virtualRows, totalHeight, measureRow } = useDynamicSizeGrid({
+  const { virtualRows, totalHeight, measureRow } = useDynamicSizeList({
     estimateRowHeight: useCallback(() => 50, []),
-    rowsCount: gridSize,
+    rowsCount,
     getScrollElement: useCallback(() => scrollElementRef.current, []),
-    getRowKey: useCallback((index) => gridItems[index]!.id, [gridItems]),
+    getRowKey: useCallback((index) => listItems[index]!.id, [listItems]),
   });
 
-  const reverseGrid = () => {
-    setGridItems((items) =>
-      items
-        .map((item) => ({
-          ...item,
-          columns: item.columns.slice().reverse(),
-        }))
-        .reverse()
-    );
+  const reverseList = () => {
+    setListItems((items) => items.slice().reverse());
   };
 
   return (
     <div style={{ padding: "0 12px" }}>
-      <h1>Grid</h1>
+      <h1>Virtualized list</h1>
       <div style={{ marginBottom: 12 }}>
-        <button onClick={reverseGrid}>reverse</button>
+        <button onClick={reverseList}>reverse</button>
       </div>
       <div
         ref={scrollElementRef}
@@ -450,28 +351,22 @@ export function Grid() {
         }}
       >
         <div style={{ height: totalHeight }}>
-          {virtualRows.map((virtualRow) => {
-            const row = gridItems[virtualRow.index]!;
+          {virtualRows.map((virtualItem) => {
+            const item = listItems[virtualItem.index]!;
 
             return (
               <div
-                key={row.id}
-                data-row-index={virtualRow.index}
+                key={item.id}
+                data-index={virtualItem.index}
                 ref={measureRow}
                 style={{
                   position: "absolute",
                   top: 0,
-                  transform: `translateY(${virtualRow.offsetTop}px)`,
+                  transform: `translateY(${virtualItem.offsetTop}px)`,
                   padding: "6px 12px",
-                  display: "flex",
                 }}
               >
-                {virtualRow.index}
-                {row.columns.map((col) => (
-                  <div key={col.id} style={{ width: 200 }}>
-                    {col.text}
-                  </div>
-                ))}
+                {virtualItem.index} {item.text}
               </div>
             );
           })}
